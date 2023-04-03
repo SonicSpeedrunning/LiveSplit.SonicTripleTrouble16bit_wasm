@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 asr = { git = "https://github.com/CryZe/asr", features = ["signature", "derive"] }
 spinning_top = "0.2.5"
+lol_alloc = "0.3.0"
 
 [lib]
 crate-type = ["cdylib"]
