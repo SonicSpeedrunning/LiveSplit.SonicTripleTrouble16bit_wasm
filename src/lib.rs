@@ -151,18 +151,18 @@ impl ProcessInfo {
 
         if self.is_64_bit {
             let sigscan = ROOMID_SIG64.scan_process_range(&self.game, self.main_module_base, self.main_module_size)?;
-            let ptr = sigscan.0 + 6;
+            let ptr = sigscan.0 + 2;
             room_id = Address(ptr + 0x4 + game.read::<u32>(Address(ptr)).ok()? as u64);
 
             let sigscan = ROOMARRAY_SIG64.scan_process_range(&self.game, self.main_module_base, self.main_module_size)?;
-            let ptr = sigscan.0 + 5;
+            let ptr = sigscan.0 + 3;
             room_id_array = Address(ptr + 0x4 + game.read::<u32>(Address(ptr)).ok()? as u64);
         } else {
             let sigscan = ROOMID_SIG32.scan_process_range(game, self.main_module_base, self.main_module_size)?;
-            room_id = Address(game.read::<u32>(Address(sigscan.0 + 2)).ok()? as u64);
+            room_id = Address(game.read::<u32>(Address(sigscan.0 + 1)).ok()? as u64);
 
             let sigscan = ROOMARRAY_SIG32.scan_process_range(game, self.main_module_base, self.main_module_size)?;
-            room_id_array = Address(game.read::<u32>(Address(sigscan.0 + 2)).ok()? as u64);
+            room_id_array = Address(game.read::<u32>(Address(sigscan.0 + 1)).ok()? as u64);
         }
 
         Some(MemoryPtr {
@@ -416,7 +416,7 @@ enum GameState
     Other,
 }
 
-const ROOMID_SIG32: Signature<11> = Signature::new("8B 0D ???????? 83 C4 04 3B 0D");
-const ROOMID_SIG64: Signature<6> = Signature::new("4D 0F 45 F5 8B 0D");
-const ROOMARRAY_SIG32: Signature<8> = Signature::new("8B 3D ???????? 2B EF");
-const ROOMARRAY_SIG64: Signature<13> = Signature::new("74 0C 48 8B 05 ???????? 48 8B 04 D0");
+const ROOMID_SIG32: Signature<105> = Signature::new("A3 ?? ?? ?? ?? 8B 06 8B CE 57 6A 06 FF 50 ?? 6A 00 57 E8 ?? ?? ?? ?? 83 C4 08 A3 ?? ?? ?? ?? 8B 06 8B CE 57 6A 06 FF 50 ?? 6A 00 57 E8 ?? ?? ?? ?? 83 C4 08 A3 ?? ?? ?? ?? 8B 06 8B CE 57 6A 06 FF 50 ?? 6A 00 57 E8 ?? ?? ?? ?? 83 C4 08 A3 ?? ?? ?? ?? 8B 06 8B CE 57 6A 06 FF 50 ?? 6A 00 57 E8 ?? ?? ?? ?? 83 C4 08 A2");
+const ROOMID_SIG64: Signature<142> = Signature::new("89 05 ?? ?? ?? ?? 48 8B 03 4C 8D 43 38 BA 06 00 00 00 48 8B CB FF 50 ?? 33 D2 48 8D 4B 38 E8 ?? ?? ?? ?? 89 05 ?? ?? ?? ?? 48 8B 03 4C 8D 43 38 BA 06 00 00 00 48 8B CB FF 50 ?? 33 D2 48 8D 4B 38 E8 ?? ?? ?? ?? 89 05 ?? ?? ?? ?? 48 8B 03 4C 8D 43 38 BA 06 00 00 00 48 8B CB FF 50 ?? 33 D2 48 8D 4B 38 E8 ?? ?? ?? ?? 89 05 ?? ?? ?? ?? 48 8B 03 4C 8D 43 38 BA 06 00 00 00 48 8B CB FF 50 ?? 33 D2 48 8D 4B 38 E8 ?? ?? ?? ?? 88 05");
+const ROOMARRAY_SIG32: Signature<12> = Signature::new("A1 ?? ?? ?? ?? 89 1C 90 42 89 55 08");
+const ROOMARRAY_SIG64: Signature<12> = Signature::new("48 89 3D ?? ?? ?? ?? 48 8B 5C 24 30");
