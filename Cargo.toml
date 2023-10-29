@@ -7,7 +7,6 @@ edition = "2021"
 
 [dependencies]
 asr = { git = "https://github.com/LiveSplit/asr", features = ["signature", "derive"] }
-spinning_top = "0.2.5"
 
 [lib]
 crate-type = ["cdylib"]

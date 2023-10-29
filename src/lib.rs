@@ -1,50 +1,104 @@
 #![no_std]
+#![feature(type_alias_impl_trait, const_async_blocks)]
+#![warn(
+    clippy::complexity,
+    clippy::correctness,
+    clippy::perf,
+    clippy::style,
+    clippy::undocumented_unsafe_blocks,
+    rust_2018_idioms
+)]
 
 use asr::{
-    signature::Signature, string::ArrayCString, time::Duration, timer, timer::TimerState,
-    watcher::Watcher, Address, Process,
+    file_format::pe::{self, MachineType},
+    future::{next_tick, retry},
+    settings::Gui,
+    signature::Signature,
+    string::ArrayCString,
+    time::Duration,
+    timer::{self, TimerState},
+    watcher::Watcher,
+    Address, Address32, Address64, Process,
 };
 
-#[cfg(all(not(test), target_arch = "wasm32"))]
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    core::arch::wasm32::unreachable()
+asr::panic_handler!();
+asr::async_main!(nightly);
+
+const PROCESS_NAMES: &[&str] = &["Sonic Triple Trouble 16-Bit.exe"];
+
+async fn main() {
+    let mut settings = Settings::register();
+
+    loop {
+        // Hook to the target process
+        let process = retry(|| PROCESS_NAMES.iter().find_map(|&name| Process::attach(name))).await;
+
+        process
+            .until_closes(async {
+                // Once the target has been found and attached to, set up some default watchers
+                let mut watchers = Watchers::default();
+
+                // Perform memory scanning to look for the addresses we need
+                let addresses = Addresses::init(&process).await;
+
+                loop {
+                    // Splitting logic. Adapted from OG LiveSplit:
+                    // Order of execution
+                    // 1. update() will always be run first. There are no conditions on the execution of this action.
+                    // 2. If the timer is currently either running or paused, then the isLoading, gameTime, and reset actions will be run.
+                    // 3. If reset does not return true, then the split action will be run.
+                    // 4. If the timer is currently not running (and not paused), then the start action will be run.
+                    settings.update();
+                    update_loop(&process, &addresses, &mut watchers);
+
+                    let timer_state = timer::state();
+                    if timer_state == TimerState::Running || timer_state == TimerState::Paused {
+                        if let Some(is_loading) = is_loading(&watchers, &settings) {
+                            if is_loading {
+                                timer::pause_game_time()
+                            } else {
+                                timer::resume_game_time()
+                            }
+                        }
+
+                        if let Some(game_time) = game_time(&watchers, &settings) {
+                            timer::set_game_time(game_time)
+                        }
+
+                        if reset(&watchers, &settings) {
+                            timer::reset()
+                        } else if split(&watchers, &settings) {
+                            timer::split()
+                        }
+                    }
+
+                    if timer::state() == TimerState::NotRunning && start(&watchers, &settings) {
+                        timer::start();
+                        timer::pause_game_time();
+
+                        if let Some(is_loading) = is_loading(&watchers, &settings) {
+                            if is_loading {
+                                timer::pause_game_time()
+                            } else {
+                                timer::resume_game_time()
+                            }
+                        }
+                    }
+
+                    next_tick().await;
+                }
+            })
+            .await;
+    }
 }
 
-static AUTOSPLITTER: spinning_top::Spinlock<State> = spinning_top::const_spinlock(State {
-    game: None,
-    watchers: Watchers {
-        state: Watcher::new(),
-        levelid: Watcher::new(),
-    },
-    settings: None,
-});
-
-struct State {
-    game: Option<ProcessInfo>,
-    watchers: Watchers,
-    settings: Option<Settings>,
-}
-
-struct ProcessInfo {
-    game: Process,
-    is_64_bit: bool,
-    main_module_base: Address,
-    main_module_size: u64,
-    addresses: Option<MemoryPtr>,
-}
-
+#[derive(Default)]
 struct Watchers {
     state: Watcher<GameState>,
     levelid: Watcher<Acts>,
 }
 
-struct MemoryPtr {
-    room_id: Address,
-    room_id_array: Address,
-}
-
-#[derive(asr::Settings)]
+#[derive(Gui)]
 struct Settings {
     #[default = true]
     /// AUTO START
@@ -114,185 +168,137 @@ struct Settings {
     final_trouble: bool,
 }
 
-impl ProcessInfo {
-    fn attach_process() -> Option<Self> {
-        const PROCESS_NAMES: [&str; 1] = ["Sonic Triple Trouble 16-Bit.exe"];
-        let mut proc: Option<Process> = None;
-        let mut proc_name: Option<&str> = None;
+struct Addresses {
+    room_id: Address,
+    room_id_array: Address,
+    is_64_bit: bool,
+}
 
-        for name in PROCESS_NAMES {
-            proc = Process::attach(name);
-            if proc.is_some() {
-                proc_name = Some(name);
-                break;
-            }
-        }
+impl Addresses {
+    async fn init(process: &Process) -> Self {
+        let main_module = {
+            let main_module_base = retry(|| {
+                PROCESS_NAMES
+                    .iter()
+                    .find_map(|&name| process.get_module_address(name).ok())
+            })
+            .await;
+            let main_module_size =
+                retry(|| pe::read_size_of_image(process, main_module_base)).await as u64;
 
-        let game = proc?;
-        let main_module_base = game.get_module_address(proc_name?).ok()?;
-        let main_module_size = game.get_module_size(proc_name?).ok()?;
-        let is_64_bit = ROOMID_SIG64
-            .scan_process_range(&game, main_module_base, main_module_size)
-            .is_some();
+            (main_module_base, main_module_size)
+        };
 
-        Some(Self {
-            game,
-            is_64_bit,
-            main_module_base,
-            main_module_size,
-            addresses: None,
-        })
-    }
+        let is_64_bit =
+            retry(|| pe::MachineType::read(process, main_module.0)).await == MachineType::X86_64;
 
-    fn look_for_addresses(&mut self) -> Option<MemoryPtr> {
         let room_id: Address;
         let room_id_array: Address;
-        let game = &self.game;
 
-        if self.is_64_bit {
-            let sigscan = ROOMID_SIG64.scan_process_range(
-                &self.game,
-                self.main_module_base,
-                self.main_module_size,
-            )?;
-            let ptr = sigscan.0 + 2;
-            room_id = Address(ptr + 0x4 + game.read::<u32>(Address(ptr)).ok()? as u64);
+        if is_64_bit {
+            let sigscan = retry(|| ROOMID_SIG64.scan_process_range(process, main_module)).await;
+            let ptr = sigscan + 2;
+            room_id = ptr + 0x4 + retry(|| process.read::<i32>(ptr)).await;
 
-            let sigscan = ROOMARRAY_SIG64.scan_process_range(
-                &self.game,
-                self.main_module_base,
-                self.main_module_size,
-            )?;
-            let ptr = sigscan.0 + 3;
-            room_id_array = Address(ptr + 0x4 + game.read::<u32>(Address(ptr)).ok()? as u64);
+            let sigscan = retry(|| ROOMARRAY_SIG64.scan_process_range(process, main_module)).await;
+            let ptr = sigscan + 3;
+            room_id_array = ptr + 0x4 + retry(|| process.read::<i32>(ptr)).await;
         } else {
-            let sigscan = ROOMID_SIG32.scan_process_range(
-                game,
-                self.main_module_base,
-                self.main_module_size,
-            )?;
-            room_id = Address(game.read::<u32>(Address(sigscan.0 + 1)).ok()? as u64);
+            let sigscan = retry(|| ROOMID_SIG32.scan_process_range(process, main_module)).await;
+            room_id = retry(|| process.read::<Address32>(sigscan + 1))
+                .await
+                .into();
 
-            let sigscan = ROOMARRAY_SIG32.scan_process_range(
-                game,
-                self.main_module_base,
-                self.main_module_size,
-            )?;
-            room_id_array = Address(game.read::<u32>(Address(sigscan.0 + 1)).ok()? as u64);
+            let sigscan = retry(|| ROOMARRAY_SIG32.scan_process_range(process, main_module)).await;
+            room_id_array = retry(|| process.read::<Address32>(sigscan + 1))
+                .await
+                .into();
         }
 
-        Some(MemoryPtr {
+        Self {
             room_id,
             room_id_array,
-        })
+            is_64_bit,
+        }
     }
 }
 
-impl State {
-    fn init(&mut self) -> bool {
-        if self.game.is_none() {
-            self.game = ProcessInfo::attach_process()
-        }
+fn update_loop(proc: &Process, addresses: &Addresses, watchers: &mut Watchers) {
+    let room_id = match proc.read::<u32>(addresses.room_id) {
+        Ok(x) => x,
+        _ => 0,
+    };
 
-        let Some(game) = &mut self.game else {
-            return false
-        };
+    let mut room_name = ArrayCString::<25>::new();
 
-        if !game.game.is_open() {
-            self.game = None;
-            return false;
-        }
-
-        if game.addresses.is_none() {
-            game.addresses = game.look_for_addresses()
-        }
-
-        game.addresses.is_some()
-    }
-
-    fn update(&mut self) {
-        let Some(game) = &self.game else { return };
-        let Some(addresses) = &game.addresses else { return };
-        let proc = &game.game;
-
-        let room_id = match proc.read::<u32>(addresses.room_id) {
-            Ok(x) => x,
-            _ => 0,
-        };
-
-        let mut room_name = ArrayCString::<25>::new();
-
-        if game.is_64_bit {
-            if let Ok(addr) = proc.read::<u64>(addresses.room_id_array) {
-                if let Ok(addr) = proc.read::<u64>(Address(addr + room_id as u64 * 8)) {
-                    if let Ok(addr) = proc.read(Address(addr)) {
-                        room_name = addr;
-                    }
-                }
-            }
-        } else if let Ok(addr) = proc.read::<u32>(addresses.room_id_array) {
-            if let Ok(addr) = proc.read::<u32>(Address(addr as u64 + room_id as u64 * 4)) {
-                if let Ok(addr) = proc.read(Address(addr as u64)) {
+    if addresses.is_64_bit {
+        if let Ok(addr) = proc.read::<Address64>(addresses.room_id_array) {
+            if let Ok(addr) = proc.read::<Address64>(addr + room_id as u64 * 8) {
+                if let Ok(addr) = proc.read(addr) {
                     room_name = addr;
                 }
             }
         }
-
-        let room_name_bytes = room_name.as_bytes();
-
-        let act = match room_name_bytes {
-            b"rmAIZ" | b"rmZONE0bit" | b"rmZIBbit" => Acts::AngelIsland,
-            b"rmZONE0" => Acts::ZoneZero,
-            b"rmGTZ1" => Acts::GreatTurquoise1,
-            b"rmGTZ2" => Acts::GreatTurquoise2,
-            b"rmSPZ1" => Acts::SunsetPark1,
-            b"rmSPZ2" => Acts::SunsetPark2,
-            b"rmSPZ3" => Acts::SunsetPark3,
-            b"rmMJZ1" => Acts::MetaJunglira1,
-            b"rmMJZ2" => Acts::MetaJunglira2,
-            b"rmEZZ" => Acts::EggZeppelin,
-            b"rmRWZ1" => Acts::RobotnikWinter1,
-            b"rmRWZ_Awa" | b"rmRWZ2" => Acts::RobotnikWinter2,
-            b"rmTPZ1" => Acts::TidalPlant1,
-            b"rmTPZ2" => Acts::TidalPlant2,
-            b"rmTPZ3" => Acts::TidalPlant3,
-            b"rmADZ1" => Acts::AtomicDestroyer1,
-            b"rmADZ2" => Acts::AtomicDestroyer2,
-            b"rmADZ3" => Acts::AtomicDestroyer3,
-            b"rmFinal" => Acts::FinalTrouble,
-            b"rmPPZ" => Acts::PurplePalace,
-            b"rmFinalEnding" | b"rmKnuxEnding" | b"rmKnuxEnding2" | b"rmCredits" => Acts::Credits,
-            _ => match &self.watchers.levelid.pair {
-                Some(x) => x.current,
-                _ => Acts::None,
-            },
-        };
-
-        let state = match room_name_bytes {
-            b"rmDataSelect" => GameState::DataSelect,
-            b"rmGameStart" => GameState::GameStart,
-            _ => GameState::Other,
-        };
-
-        self.watchers.state.update(Some(state));
-        self.watchers.levelid.update(Some(act));
-    }
-
-    fn start(&mut self) -> bool {
-        let Some(settings) = &self.settings else { return false };
-        if !settings.start {
-            return false;
+    } else if let Ok(addr) = proc.read::<Address32>(addresses.room_id_array) {
+        if let Ok(addr) = proc.read::<Address32>(addr + room_id * 4) {
+            if let Ok(addr) = proc.read(addr) {
+                room_name = addr;
+            }
         }
-
-        let Some(state) = &self.watchers.state.pair else { return false };
-        state.old == GameState::DataSelect && state.current == GameState::GameStart
     }
 
-    fn split(&mut self) -> bool {
-        let Some(levelid) = &self.watchers.levelid.pair else { return false };
-        let Some(settings) = &self.settings else { return false };
+    let room_name_bytes = room_name.as_bytes();
 
-        match levelid.current {
+    let act = match room_name_bytes {
+        b"rmAIZ" | b"rmZONE0bit" | b"rmZIBbit" => Acts::AngelIsland,
+        b"rmZONE0" => Acts::ZoneZero,
+        b"rmGTZ1" => Acts::GreatTurquoise1,
+        b"rmGTZ2" => Acts::GreatTurquoise2,
+        b"rmSPZ1" => Acts::SunsetPark1,
+        b"rmSPZ2" => Acts::SunsetPark2,
+        b"rmSPZ3" => Acts::SunsetPark3,
+        b"rmMJZ1" => Acts::MetaJunglira1,
+        b"rmMJZ2" => Acts::MetaJunglira2,
+        b"rmEZZ" => Acts::EggZeppelin,
+        b"rmRWZ1" => Acts::RobotnikWinter1,
+        b"rmRWZ_Awa" | b"rmRWZ2" => Acts::RobotnikWinter2,
+        b"rmTPZ1" => Acts::TidalPlant1,
+        b"rmTPZ2" => Acts::TidalPlant2,
+        b"rmTPZ3" => Acts::TidalPlant3,
+        b"rmADZ1" => Acts::AtomicDestroyer1,
+        b"rmADZ2" => Acts::AtomicDestroyer2,
+        b"rmADZ3" => Acts::AtomicDestroyer3,
+        b"rmFinal" => Acts::FinalTrouble,
+        b"rmPPZ" => Acts::PurplePalace,
+        b"rmFinalEnding" | b"rmKnuxEnding" | b"rmKnuxEnding2" | b"rmCredits" => Acts::Credits,
+        _ => match &watchers.levelid.pair {
+            Some(x) => x.current,
+            _ => Acts::None,
+        },
+    };
+
+    let state = match room_name_bytes {
+        b"rmDataSelect" => GameState::DataSelect,
+        b"rmGameStart" => GameState::GameStart,
+        _ => GameState::Other,
+    };
+
+    watchers.state.update_infallible(state);
+    watchers.levelid.update_infallible(act);
+}
+
+fn start(watchers: &Watchers, settings: &Settings) -> bool {
+    settings.start
+        && watchers.state.pair.is_some_and(|val| {
+            val.old == GameState::DataSelect && val.current == GameState::GameStart
+        })
+}
+
+fn split(watchers: &Watchers, settings: &Settings) -> bool {
+    watchers
+        .levelid
+        .pair
+        .is_some_and(|levelid| match levelid.current {
             Acts::GreatTurquoise1 => {
                 (settings.zone_zero && levelid.old == Acts::ZoneZero)
                     || (settings.angel_island && levelid.old == Acts::AngelIsland)
@@ -334,76 +340,22 @@ impl State {
                     || (settings.final_trouble && levelid.old == Acts::FinalTrouble)
             }
             _ => false,
-        }
-    }
-
-    fn reset(&mut self) -> bool {
-        let Some(settings) = &self.settings else { return false };
-        if !settings.reset {
-            return false;
-        }
-
-        let Some(state) = &self.watchers.state.pair else { return false };
-        state.old == GameState::DataSelect && state.current == GameState::GameStart
-    }
-
-    fn is_loading(&mut self) -> Option<bool> {
-        None
-    }
-
-    fn game_time(&mut self) -> Option<Duration> {
-        None
-    }
+        })
 }
 
-#[no_mangle]
-pub extern "C" fn update() {
-    // Get access to the spinlock
-    let autosplitter = &mut AUTOSPLITTER.lock();
+fn reset(watchers: &Watchers, settings: &Settings) -> bool {
+    settings.reset
+        && watchers.state.pair.is_some_and(|val| {
+            val.old == GameState::DataSelect && val.current == GameState::GameStart
+        })
+}
 
-    // Sets up the settings
-    autosplitter.settings.get_or_insert_with(Settings::register);
+fn is_loading(_watchers: &Watchers, _settings: &Settings) -> Option<bool> {
+    None
+}
 
-    // Main autosplitter logic, essentially refactored from the OG LivaSplit autosplitting component.
-    // First of all, the autosplitter needs to check if we managed to attach to the target process,
-    // otherwise there's no need to proceed further.
-    if !autosplitter.init() {
-        return;
-    }
-
-    // The main update logic is launched with this
-    autosplitter.update();
-
-    // Splitting logic. Adapted from OG LiveSplit:
-    // Order of execution
-    // 1. update() [this is launched above] will always be run first. There are no conditions on the execution of this action.
-    // 2. If the timer is currently either running or paused, then the isLoading, gameTime, and reset actions will be run.
-    // 3. If reset does not return true, then the split action will be run.
-    // 4. If the timer is currently not running (and not paused), then the start action will be run.
-    let timer_state = timer::state();
-    if timer_state == TimerState::Running || timer_state == TimerState::Paused {
-        if let Some(is_loading) = autosplitter.is_loading() {
-            if is_loading {
-                timer::pause_game_time()
-            } else {
-                timer::resume_game_time()
-            }
-        }
-
-        if let Some(game_time) = autosplitter.game_time() {
-            timer::set_game_time(game_time)
-        }
-
-        if autosplitter.reset() {
-            timer::reset()
-        } else if autosplitter.split() {
-            timer::split()
-        }
-    }
-
-    if timer::state() == TimerState::NotRunning && autosplitter.start() {
-        timer::start()
-    }
+fn game_time(_watchers: &Watchers, _settings: &Settings) -> Option<Duration> {
+    None
 }
 
 #[derive(Clone, Copy, PartialEq)]
